@@ -1,11 +1,16 @@
 import "./pdfPollyfill";
-import { createCanvas,loadImage } from "canvas";
+import { createCanvas } from "canvas";
 import type { Canvas } from "canvas";
 import { NodeCanvasFactory } from "./NodeCanvasFactory";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf";
-import type { DocumentInitParameters,RenderParameters,PDFPageProxy } from "pdfjs-dist/types/src/display/api";
-import path from "path";
-import { createWorker, Worker,PSM, type Lang } from "tesseract.js";
+import type {
+  DocumentInitParameters,
+  RenderParameters,
+  PDFPageProxy,
+} from "pdfjs-dist/types/src/display/api";
+
+import axios from "axios";
+import FormData from "form-data";
 
 interface NodeDocumentInitParameters extends DocumentInitParameters {
   disableWorker: boolean;
@@ -14,14 +19,6 @@ interface NodeDocumentInitParameters extends DocumentInitParameters {
   useSystemFonts: boolean;
   nativeImageDecoderSupport: "none";
 }
-
-interface OrientationData {
-  orientation?: {
-    deg: number;
-    confidence: number;
-  };
-}
-
 
 export interface PdfOcrResult {
   image: Buffer;
@@ -32,144 +29,90 @@ type NodeRenderParameters = RenderParameters & {
   canvasFactory: NodeCanvasFactory;
 };
 
-let worker: Worker | null = null;
+async function pythonOcr(buffer: Buffer): Promise<{
+  text: string;
+  image: Buffer;
+}> {
 
+  const formData = new FormData();
 
-async function getWorker(): Promise<Worker> {
+  formData.append("file", buffer, {
+    filename: "page.png",
+    contentType: "image/png",
+  });
 
-    if (worker) return worker;
-
-    worker = await createWorker(["osd"] as unknown as Lang[], 0,{
-        workerPath: path.join(
-            process.cwd(),
-            "node_modules/tesseract.js/src/worker-script/node/index.js"
-        ),
-
-        corePath: path.join(
-            process.cwd(),
-            "node_modules/tesseract.js-core/tesseract-core.wasm.js"
-        ),
-        langPath: path.join(process.cwd(), "tessdata")
-        }
-    );
-
-    return worker;
-}
-
-
-
-async function rotateBufferIfNeeded(
-  buffer: Buffer,
-  rotation: number
-): Promise<Buffer> {
-
-  const normalizedRotation = rotation % 360;
-
-  if (![90, 180, 270].includes(normalizedRotation)) {
-    return buffer;
-  }
-
-  const img = await loadImage(buffer);
-
-  const rotatedCanvas =
-    normalizedRotation === 180
-      ? createCanvas(img.width, img.height)
-      : createCanvas(img.height, img.width);
-
-  const ctx = rotatedCanvas.getContext("2d");
-
-  ctx.translate(rotatedCanvas.width / 2, rotatedCanvas.height / 2);
-  ctx.rotate((normalizedRotation * Math.PI) / 180);
-  ctx.drawImage(
-    img,
-    -img.width / 2,
-    -img.height / 2
+  const res = await axios.post(
+    "http://127.0.0.1:8000/ocr",
+    formData,
+    { headers: formData.getHeaders() }
   );
 
-  return rotatedCanvas.toBuffer("image/png");
+  return {
+    text: res.data.text,
+    image: Buffer.from(res.data.image, "base64"),
+  };
 }
+
 
 export async function pdfPageToImage(
   pdfBuffer: Buffer,
   pageNumber: number = 1
 ): Promise<PdfOcrResult> {
 
-    const uint8Array = new Uint8Array(pdfBuffer); 
+  const uint8Array = new Uint8Array(pdfBuffer);
 
-    const params: NodeDocumentInitParameters = {
-        data: uint8Array,
-        disableWorker: true,
-        useWorkerFetch: false,
-        isEvalSupported: false,
-        useSystemFonts: true,
-        nativeImageDecoderSupport: "none",
-    };
-    const loadingTask = pdfjsLib.getDocument(params);
-    const pdf = await loadingTask.promise;
-    const page:PDFPageProxy  = await pdf.getPage(pageNumber);
+  const params: NodeDocumentInitParameters = {
+    data: uint8Array,
+    disableWorker: true,
+    useWorkerFetch: false,
+    isEvalSupported: false,
+    useSystemFonts: true,
+    nativeImageDecoderSupport: "none",
+  };
 
-    const pdfRotation = page.rotate ?? 0;
+  const loadingTask = pdfjsLib.getDocument(params);
+  const pdf = await loadingTask.promise;
+  const page: PDFPageProxy = await pdf.getPage(pageNumber);
 
-    const normalizedRotation = (360 - pdfRotation) % 360;
-    const viewport = page.getViewport({ scale: 2, rotation:normalizedRotation });
+  const pdfRotation = page.rotate ?? 0;
+  // const normalizedRotation = (360 - pdfRotation) % 360;
 
-    const canvasFactory = new NodeCanvasFactory();
+  const viewport = page.getViewport({
+    scale: 2,
+    rotation: 0,
+  });
 
-    const { canvas, context } = canvasFactory.create(
-        viewport.width,
-        viewport.height
-    );
+  // radians
+  const radians = (pdfRotation * Math.PI) / 180;
+  // compute rotated bounding box
+  const rotatedWidth = Math.abs(viewport.width * Math.cos(radians)) +
+                      Math.abs(viewport.height * Math.sin(radians));
+  const rotatedHeight = Math.abs(viewport.width * Math.sin(radians)) +
+                        Math.abs(viewport.height * Math.cos(radians));
 
-    const renderContext: NodeRenderParameters = {
-        canvasContext: context as unknown as CanvasRenderingContext2D,
-        viewport,
-        canvasFactory,
-    };
+  const canvasFactory =  new NodeCanvasFactory();
+  const { canvas, context } = canvasFactory.create(rotatedWidth, rotatedHeight);
 
-    await page.render(renderContext).promise;
-    const nodeCanvas = canvas as unknown as Canvas;
-    let pngBuffer = nodeCanvas.toBuffer("image/png", {
-        resolution: 300,
-    });
+  context.save();
+  context.translate(rotatedWidth / 2, rotatedHeight / 2);
+  context.rotate(radians);
+  context.translate(-viewport.width / 2, -viewport.height / 2);
 
+  await page.render({
+    canvasContext: context as unknown as CanvasRenderingContext2D,
+    viewport,   
+  }).promise;
 
-    const worker = await getWorker();
-    await worker.reinitialize(["osd"] as unknown as Lang[]);
-    // Detect Rotation
-    await worker.setParameters({
-        tessedit_pageseg_mode: PSM.OSD_ONLY,
-        user_defined_dpi: "300",
-        min_characters_to_try: "50"
-    });
+  context.restore();
 
-    const { data } = await worker.detect(pngBuffer);
-    const orientation = (data as unknown as OrientationData).orientation;
-    console.log("Detected Rotation Degree:", orientation?.deg);
-    console.log("Confidence:", orientation?.confidence);
-    if (orientation?.deg && orientation.deg !== 0) {
+  const nodeCanvas = canvas as unknown as Canvas;
 
-        const autoRotation = (360 - orientation.deg) % 360;
-        console.log("Auto Rotating by:", autoRotation);
-        pngBuffer = await rotateBufferIfNeeded(
-            pngBuffer,
-            autoRotation
-        );
-    }
+  const pngBuffer = nodeCanvas.toBuffer("image/png");
 
-    await worker.reinitialize(["eng"] as unknown as Lang[]);
-    // switch back to ocr
-    await worker.setParameters({
-        tessedit_pageseg_mode: PSM.AUTO,
-        user_defined_dpi: "300"
-    });
+  const {text,image} = await pythonOcr(pngBuffer);
 
-    const {
-        data: { text },
-    } = await worker.recognize(pngBuffer);
-
-
-    return {
-        image: pngBuffer,
-        text,
-    };
+  return {
+    image,
+    text
+  };
 }
