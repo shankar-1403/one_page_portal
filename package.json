@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "tesseract.js": "^5.1.1",
     "@napi-rs/canvas": "^0.1.92",
     "axios": "^1.13.5",
     "canvas": "^3.2.1",
