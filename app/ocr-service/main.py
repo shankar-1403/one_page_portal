@@ -8,63 +8,116 @@ import pytesseract
 from pytesseract import Output
 import base64
 from collections import defaultdict
+from paddleocr import PaddleOCR
+from paddleocr import PPStructure
+import paddle
+from bs4 import BeautifulSoup
 
+table_engine = PPStructure(
+    show_log=False,
+    layout=True,
+    table=True,
+    ocr=True
+)
+
+# Engine location
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-os.environ["TESSDATA_PREFIX"] = r"C:\Program Files\Tesseract-OCR\tessdata"
+
+# Model location (project)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TESSDATA_DIR = os.path.join(BASE_DIR, "tessdata")
+
+os.environ["TESSDATA_PREFIX"] = TESSDATA_DIR
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["PADDLE_DISABLE_STATIC_OP"] = "1"
 
 app = FastAPI()
 
+paddle.set_device('cpu')
 
-def _ocr_confidence(img: np.ndarray) -> float:
-    """Run OCR and return average confidence of detected words. Higher = better orientation."""
-    try:
-        data = pytesseract.image_to_data(img, lang="eng", output_type=Output.DICT)
-        confs = [int(c) for c in data["conf"] if c != "-1" and int(c) > 0]
-        return sum(confs) / len(confs) if confs else 0
-    except Exception:
-        return 0
+paddle_ocr = PaddleOCR(use_angle_cls=True,lang="en")
 
+def fix_orientation(image: np.ndarray) -> np.ndarray:
 
-def correct_rotation(image: np.ndarray) -> np.ndarray:
-    """Detect and correct image rotation. Uses OSD first, then fallback to trying all orientations."""
-    if len(image.shape) == 3 and image.shape[2] == 4:
-        image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    # 1. Try Tesseract OSD
-    rotation = 0
-    try:
-        osd = pytesseract.image_to_osd(gray, config="--psm 0")
-        for line in osd.split("\n"):
-            if "Rotate" in line:
-                rotation = int(line.split(":")[1].strip())
-                break
-    except Exception:
-        pass
+    osd = pytesseract.image_to_osd(rgb, output_type=Output.DICT)
 
-    if rotation == 90:
+    angle = osd["rotate"]
+
+    if angle == 0:
+        return image
+
+    if angle == 90:
         return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-    if rotation == 180:
+
+    if angle == 180:
         return cv2.rotate(image, cv2.ROTATE_180)
-    if rotation == 270:
+
+    if angle == 270:
         return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-    # 2. Fallback: OSD failed (tables, sparse text). Try all 4 orientations, pick best by OCR confidence
-    candidates = [
-        (image, "0"),
-        (cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE), "90"),
-        (cv2.rotate(image, cv2.ROTATE_180), "180"),
-        (cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE), "270"),
-    ]
-    best_img = image
-    best_conf = _ocr_confidence(image)
-    for img, _ in candidates[1:]:
-        conf = _ocr_confidence(img)
-        if conf > best_conf:
-            best_conf = conf
-            best_img = img
+    return image
 
-    return best_img
+def correct_rotation(image: np.ndarray) -> np.ndarray:
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Edge detect text lines
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    # Detect straight lines in document
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180,
+        threshold=100,
+        minLineLength=200,
+        maxLineGap=20
+    )
+
+    if lines is None:
+        return image
+
+    angles = []
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+
+        # Ignore vertical lines
+        if -45 < angle < 45:
+            angles.append(angle)
+
+    if len(angles) == 0:
+        return image
+
+    median_angle = np.median(angles)
+
+    # Rotate image properly
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+
+    M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+
+    cos = np.abs(M[0, 0])
+    sin = np.abs(M[0, 1])
+
+    new_w = int((h * sin) + (w * cos))
+    new_h = int((h * cos) + (w * sin))
+
+    M[0, 2] += (new_w / 2) - center[0]
+    M[1, 2] += (new_h / 2) - center[1]
+
+    rotated = cv2.warpAffine(
+        image,
+        M,
+        (new_w, new_h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+    return rotated
 
 def _read_image(contents: bytes) -> np.ndarray:
     """Decode image, handling RGBA from canvas PNG."""
@@ -79,92 +132,66 @@ def _read_image(contents: bytes) -> np.ndarray:
     return image
 
 
-@app.post("/ocr")
-async def ocr(file: UploadFile):
-    contents = await file.read()
-    image = _read_image(contents)
-    rotated = correct_rotation(image)
-
-    # OCR
-    text = pytesseract.image_to_string(rotated, lang='eng')
-
-    # Encode rotated image back to base64 PNG
-    _, buffer = cv2.imencode('.png', rotated)
-    encoded_image = base64.b64encode(buffer).decode('utf-8')
-
-    return JSONResponse({
-        "text": text,
-        "image": encoded_image
-    })
-
-
-def _build_structure(data: dict) -> list:
-    """Build blocks → paragraphs → lines → words hierarchy from Tesseract image_to_data output."""
-    n = len(data["text"])
-    blocks_map: dict = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-
-    for i in range(n):
-        text = (data["text"][i] or "").strip()
-        if not text:
-            continue
-        block_num = data["block_num"][i]
-        par_num = data["par_num"][i]
-        line_num = data["line_num"][i]
-
-        word = {
-            "text": text,
-            "left": int(data["left"][i]),
-            "top": int(data["top"][i]),
-            "width": int(data["width"][i]),
-            "height": int(data["height"][i]),
-            "conf": int(data["conf"][i]) if data["conf"][i] != "-1" else 0,
-        }
-        blocks_map[block_num][par_num][line_num].append(word)
-
-    # Convert to ordered structure
-    result = []
-    for block_num in sorted(blocks_map.keys()):
-        block_pars = blocks_map[block_num]
-        paragraphs = []
-        for par_num in sorted(block_pars.keys()):
-            par_lines = block_pars[par_num]
-            lines = []
-            for line_num in sorted(par_lines.keys()):
-                words = par_lines[line_num]
-                line_text = " ".join(w["text"] for w in words)
-                lines.append({
-                    "words": words,
-                    "text": line_text.strip(),
-                })
-            par_text = "\n".join(ln["text"] for ln in lines)
-            paragraphs.append({
-                "lines": lines,
-                "text": par_text.strip(),
-            })
-        block_text = "\n\n".join(p["text"] for p in paragraphs)
-        result.append({
-            "paragraphs": paragraphs,
-            "text": block_text.strip(),
-        })
-
-    return result
-
-
 @app.post("/ocr/structured")
 async def ocr_structured(file: UploadFile):
-    """Return OCR text in same structure as document: blocks → paragraphs → lines → words."""
+
     contents = await file.read()
+
+    # ---- Read as PIL ----
     image = _read_image(contents)
+    
+    image = fix_orientation(image)
+
+    # ---- Rotate (still PIL) ----
     rotated = correct_rotation(image)
 
-    data = pytesseract.image_to_data(rotated, lang="eng", output_type=Output.DICT)
-    structure = _build_structure(data)
+    # # ---- Preprocess ----
+    gray = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3,3), 0)
 
+    processed = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        15
+    )
+
+    result = paddle_ocr.ocr(processed)
+    table_result = table_engine(processed)
+
+    tables = []
+    for block in table_result:
+        if block["type"] == "table":
+            tables.append(block["res"]["html"])
+
+
+    structure = []
+    full_text = []
+
+    if result and result[0]:
+        for line in result[0]:
+            coords = line[0] # [[x,y], [x,y], [x,y], [x,y]]
+            text = line[1][0]
+            conf = float(line[1][1])
+            
+            full_text.append(text)
+            
+            # Creating a simplified structure similar to your Tesseract builder
+            structure.append({
+                "text": text,
+                "confidence": conf,
+                "box": coords,
+            })
+
+    # Return SAME image used for OCR
     _, buffer = cv2.imencode(".png", rotated)
     encoded_image = base64.b64encode(buffer).decode("utf-8")
 
     return JSONResponse({
         "structure": structure,
-        "text": "\n\n".join(b["text"] for b in structure),
-        "image": encoded_image,
+        "text": "\n".join(full_text),
+        "tables":tables,
+        "image":encoded_image
     })
